@@ -49,9 +49,22 @@ use_repo(llvm, "llvm_toolchain_llvm")
 register_toolchains("@llvm_toolchain//:all")
 
 # tooling
+# TODO: score_tooling does not have a single release yet. It's not in the registry.
 bazel_dep(name = "score_tooling", version = "1.0.1")
+git_override(
+    module_name = "score_tooling",
+    remote = "https://github.com/etas-contrib/score_tooling.git",
+    # 2025-10-21
+    commit = "2a02497316a2150e20e20f0d0974b986ee179213",
+)
 bazel_dep(name = "aspect_rules_lint", version = "1.5.3")
 bazel_dep(name = "buildifier_prebuilt", version = "8.2.0.2")
 
-#docs-as-code -- not yet available
+# TODO: docs-as-code does not have a single release yet. It's not in the registry.
 #bazel_dep(name = "score_docs_as_code", version = "1.1.0")
+git_override(
+    module_name = "score_docs_as_code",
+    remote = "https://github.com/etas-contrib/score_docs-as-code.git",
+    # 2025-10-21
+    commit = "064c9a05b8ba45d9e83f7940a3aed301a23cd510",
+)
