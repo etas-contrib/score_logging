@@ -50,7 +50,7 @@ register_toolchains("@llvm_toolchain//:all")
 
 # tooling
 # TODO: score_tooling does not have a single release yet. It's not in the registry.
-bazel_dep(name = "score_tooling", version = "1.0.1")
+#bazel_dep(name = "score_tooling", version = "1.0.1")
 git_override(
     module_name = "score_tooling",
     remote = "https://github.com/etas-contrib/score_tooling.git",
