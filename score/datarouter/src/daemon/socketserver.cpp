@@ -171,6 +171,7 @@ std::unique_ptr<score::platform::internal::ILogParserFactory> SocketServer::Crea
         {
             auto global_handlers = dlt_server_.GetGlobalHandlers();
             score::platform::internal::LogParser::HandleRequestMap handle_request_map;
+
             for (auto& binding : dlt_server_.GetTypeHandlerBindings())
             {
                 handle_request_map.emplace(std::move(binding.type_name), binding.handler);
@@ -226,7 +227,7 @@ std::function<void(bool)> SocketServer::CreateEnableHandler(DataRouter& router,
         score::mw::log::LogWarn() << "Changing output enable to " << enable;
         WriteDltEnabled(enable, persistent_dictionary);
         router.ForEachSource(enable);
-        dlt_server.SetDltOutputEnabled(enable);
+        dlt_server.SetDltOutputEnable(enable);
     };
 }
 
@@ -294,7 +295,7 @@ std::unique_ptr<MessagePassingServer::ISession> SocketServer::CreateMessagePassi
     const auto fd = maybe_fd.value();
     const auto quota = dlt_server.GetQuota(appid);
     const auto quota_enforcement_enabled = dlt_server.GetQuotaEnforcementEnabled();
-    const bool is_dlt_enabled = dlt_server.GetDltEnabled();
+    const bool is_dlt_enabled = dlt_server.IsOutputEnabled();
     auto source_session = router.NewSourceSession(
         fd, appid, is_dlt_enabled, std::move(handle), quota, quota_enforcement_enabled, client_pid, nv_config);
     // The reason for banning is, because it's error-prone to use. One should use abstractions e.g. provided by
@@ -384,8 +385,6 @@ void SocketServer::DoWork(const std::atomic_bool& exit_requested, const bool no_
     };
 
     std::shared_ptr<ServerFactory> server_factory = std::make_shared<ServerFactory>();
-    std::shared_ptr<ClientFactory> client_factory =
-        std::make_shared<ClientFactory>(/*server_factory_->GetEngine() Ticket-234313*/);
 
     /*
     Deviation from Rule A5-1-4:
@@ -394,7 +393,7 @@ void SocketServer::DoWork(const std::atomic_bool& exit_requested, const bool no_
     - mp_server does not exist inside any lambda.
     */
     // coverity[autosar_cpp14_a5_1_4_violation: FALSE]
-    MessagePassingServer mp_server(mp_factory, std::move(server_factory), std::move(client_factory));
+    MessagePassingServer mp_server(mp_factory, std::move(server_factory));
 
     // Run main event loop
     RunEventLoop(exit_requested, router, *dlt_server, stats_logger);

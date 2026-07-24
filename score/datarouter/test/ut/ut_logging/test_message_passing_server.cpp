@@ -14,7 +14,6 @@
 #include "score/datarouter/include/daemon/message_passing_server.h"
 
 #include "score/message_passing/mock/client_connection_mock.h"
-#include "score/message_passing/mock/client_factory_mock.h"
 #include "score/message_passing/mock/server_connection_mock.h"
 #include "score/message_passing/mock/server_factory_mock.h"
 #include "score/message_passing/mock/server_mock.h"
@@ -28,6 +27,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -79,8 +79,9 @@ constexpr pid_t kClienT0Pid = 1000;
 constexpr pid_t kClienT1Pid = 1001;
 constexpr pid_t kClienT2Pid = 1002;
 constexpr std::uint32_t kMaxSendBytes{17U};
+constexpr std::uint32_t kMaxNotifyBytes{1U};
 
-std::uint32_t gKReceiverQueueMaxSize = 0;
+std::uint32_t gKReceiverQueueMaxSize = 1;
 
 class MockSession : public MessagePassingServer::ISession
 {
@@ -153,18 +154,17 @@ class MessagePassingServerFixture : public ::testing::Test
     void SetUp() override
     {
         server_factory_mock = std::make_shared<StrictMock<::score::message_passing::ServerFactoryMock>>();
-        client_factory_mock = std::make_shared<StrictMock<::score::message_passing::ClientFactoryMock>>();
 
-        const score::message_passing::IServerFactory::ServerConfig server_config{gKReceiverQueueMaxSize, 0U, 0U};
+        const score::message_passing::IServerFactory::ServerConfig server_config{gKReceiverQueueMaxSize, 0U, 1U};
 
         auto server_ptr = score::cpp::pmr::make_unique<testing::StrictMock<score::message_passing::ServerMock>>(
             score::cpp::pmr::get_default_resource());
         server_mock = server_ptr.get();
 
-        EXPECT_CALL(
-            *server_factory_mock,
-            Create(CompareServiceProtocol(ServiceProtocolConfig{"/logging.datarouter_recv", kMaxSendBytes, 0U, 0U}),
-                   CompareServerConfig(server_config)))
+        EXPECT_CALL(*server_factory_mock,
+                    Create(CompareServiceProtocol(
+                               ServiceProtocolConfig{"/logging.datarouter_recv", kMaxSendBytes, 0U, kMaxNotifyBytes}),
+                           CompareServerConfig(server_config)))
             .WillOnce(Return(ByMove(std::move(server_ptr))));
     }
 
@@ -212,11 +212,6 @@ class MessagePassingServerFixture : public ::testing::Test
             return session;
         };
     }
-    void ExpectClientDestruction(StrictMock<::score::message_passing::ClientConnectionMock>* client_mock)
-    {
-        EXPECT_CALL(*client_mock, Destruct()).Times(AnyNumber());
-    }
-
     void ExpectServerDestruction() const
     {
         EXPECT_CALL(*server_mock, Destruct()).Times(AnyNumber());
@@ -254,7 +249,29 @@ class MessagePassingServerFixture : public ::testing::Test
             });
 
         // instantiate MessagePassingServer
-        server.emplace(factory, server_factory_mock, client_factory_mock);
+        server.emplace(factory, server_factory_mock);
+    }
+
+    void InstantiateServerWithWatchdog(MessagePassingServer::SessionFactory factory,
+                                       MessagePassingServer::AcquireWatchdogConfig watchdog_config)
+    {
+        EXPECT_CALL(*server_mock,
+                    StartListening(Matcher<score::message_passing::ConnectCallback>(_),
+                                   Matcher<score::message_passing::DisconnectCallback>(_),
+                                   Matcher<score::message_passing::MessageCallback>(_),
+                                   Matcher<score::message_passing::MessageCallback>(_)))
+            .WillOnce([this](score::message_passing::ConnectCallback con_callback,
+                             score::message_passing::DisconnectCallback discon_callback,
+                             score::message_passing::MessageCallback sn_callback,
+                             score::message_passing::MessageCallback sn_rep_callback) {
+                this->connect_callback = std::move(con_callback);
+                this->disconnect_callback = std::move(discon_callback);
+                this->sent_callback = std::move(sn_callback);
+                this->sent_with_reply_callback = std::move(sn_rep_callback);
+                return score::cpp::expected_blank<score::os::Error>{};
+            });
+
+        server.emplace(factory, server_factory_mock, watchdog_config);
     }
 
     auto CreateConnectMessageSample(const pid_t)
@@ -271,27 +288,25 @@ class MessagePassingServerFixture : public ::testing::Test
         return message;
     }
 
-    StrictMock<::score::message_passing::ClientConnectionMock>* ExpectConnectCallBackCalledAndClientCreated(
-        const pid_t pid)
+    StrictMock<::score::message_passing::ServerConnectionMock>* ConnectClientAndSendConnectMessage(const pid_t pid)
     {
-        auto client = score::cpp::pmr::make_unique<testing::StrictMock<score::message_passing::ClientConnectionMock>>(
-            score::cpp::pmr::get_default_resource());
+        auto connection = std::make_unique<StrictMock<::score::message_passing::ServerConnectionMock>>();
+        auto* connection_ptr = connection.get();
+        auto emplace_result = connections.emplace(pid, std::move(connection));
+        EXPECT_TRUE(emplace_result.second);
 
-        auto* client_mock = client.get();
+        connection_identities.insert_or_assign(pid, score::message_passing::ClientIdentity{pid, 0, 0});
+        EXPECT_CALL(*connection_ptr, GetClientIdentity())
+            .Times(AnyNumber())
+            .WillRepeatedly(ReturnRef(connection_identities.at(pid)));
 
-        EXPECT_CALL(*client_factory_mock,
-                    Create(Matcher<const score::message_passing::ServiceProtocolConfig&>(_),
-                           Matcher<const score::message_passing::IClientFactory::ClientConfig&>(_)))
-            .WillOnce(Return(ByMove(std::move(client))));
-
-        StrictMock<::score::message_passing::ServerConnectionMock> connection;
-        score::message_passing::ClientIdentity client_identity{pid, 0, 0};
-        EXPECT_CALL(connection, GetClientIdentity()).Times(AnyNumber()).WillRepeatedly(ReturnRef(client_identity));
+        // Mirror production behavior: connect_callback runs before any messages.
+        std::ignore = connect_callback(*connection_ptr);
 
         auto message = CreateConnectMessageSample(pid);
-        sent_callback(connection, message);
+        sent_callback(*connection_ptr, message);
 
-        return client_mock;
+        return connection_ptr;
     }
 
     void UninstantiateServer()
@@ -304,11 +319,11 @@ class MessagePassingServerFixture : public ::testing::Test
         EXPECT_CALL(*unistd_mock, getpid()).WillRepeatedly(Return(kOurPid));
     }
 
-    void ExpectMessageSendInSequence(const DatarouterMessageIdentifier& id,
-                                     ::testing::Sequence& seq,
-                                     StrictMock<::score::message_passing::ClientConnectionMock>* client_mock)
+    void ExpectAcquireNotifyInSequence(const DatarouterMessageIdentifier& id,
+                                       ::testing::Sequence& seq,
+                                       StrictMock<::score::message_passing::ServerConnectionMock>* connection_mock)
     {
-        EXPECT_CALL(*client_mock, Send(An<score::cpp::span<const std::uint8_t>>()))
+        EXPECT_CALL(*connection_mock, Notify(An<score::cpp::span<const std::uint8_t>>()))
             .InSequence(seq)
             .WillOnce([id](const auto m) {
                 score::cpp::expected_blank<score::os::Error> ret{};
@@ -320,14 +335,13 @@ class MessagePassingServerFixture : public ::testing::Test
             });
     }
 
-    void ExpectAndFailShortMessageSend(StrictMock<::score::message_passing::ClientConnectionMock>* client_mock)
+    void ExpectAndFailAcquireNotify(StrictMock<::score::message_passing::ServerConnectionMock>* connection_mock)
     {
-        EXPECT_CALL(*client_mock, Send(Matcher<score::cpp::span<const std::uint8_t>>(_)))
+        EXPECT_CALL(*connection_mock, Notify(Matcher<score::cpp::span<const std::uint8_t>>(_)))
             .WillOnce(Return(score::cpp::make_unexpected(score::os::Error::createFromErrno(EINVAL))));
     }
 
     StrictMock<::score::message_passing::ServerMock>* server_mock{};
-    std::shared_ptr<StrictMock<::score::message_passing::ClientFactoryMock>> client_factory_mock;
     std::shared_ptr<StrictMock<::score::message_passing::ServerFactoryMock>> server_factory_mock;
     ::score::os::MockGuard<score::os::UnistdMock> unistd_mock{};
 
@@ -336,6 +350,9 @@ class MessagePassingServerFixture : public ::testing::Test
     score::message_passing::DisconnectCallback disconnect_callback;
     score::message_passing::MessageCallback sent_callback;
     score::message_passing::MessageCallback sent_with_reply_callback;
+
+    std::unordered_map<pid_t, std::unique_ptr<StrictMock<::score::message_passing::ServerConnectionMock>>> connections;
+    std::map<pid_t, score::message_passing::ClientIdentity> connection_identities;
 
     std::mutex map_mutex;
     std::condition_variable map_cond;  // currently only used for destruction
@@ -395,7 +412,7 @@ TEST_F(MessagePassingServerFixture, TestFailedStartListening)
             return score::cpp::expected_blank<score::os::Error>{};
         });
     // instantiate MessagePassingServer
-    server.emplace(factory, server_factory_mock, client_factory_mock);
+    server.emplace(factory, server_factory_mock);
     ExpectServerDestruction();
 
     UninstantiateServer();
@@ -413,7 +430,7 @@ TEST_F(MessagePassingServerFixture, TestStartListeningFailure)
                                Matcher<score::message_passing::MessageCallback>(_)))
         .WillOnce(Return(score::cpp::make_unexpected(score::os::Error::createFromErrno(EINVAL))));
 
-    server.emplace(factory, server_factory_mock, client_factory_mock);
+    server.emplace(factory, server_factory_mock);
     ExpectServerDestruction();
     UninstantiateServer();
 }
@@ -427,40 +444,37 @@ TEST_F(MessagePassingServerFixture, TestOneConnectAcquireRelease)
     EXPECT_EQ(tick_count, 0);
     EXPECT_EQ(construct_count, 0);
 
-    auto* client = ExpectConnectCallBackCalledAndClientCreated(kClienT0Pid);
+    auto* connection_ptr = ConnectClientAndSendConnectMessage(kClienT0Pid);
 
     EXPECT_EQ(construct_count, 1);
-    EXPECT_CALL(*client,
-                Start(Matcher<score::message_passing::IClientConnection::StateCallback>(_),
-                      Matcher<score::message_passing::IClientConnection::NotifyCallback>(_)));
-
-    EXPECT_CALL(*client, GetState()).WillRepeatedly(Return(score::message_passing::IClientConnection::State::kReady));
-
     ::testing::Sequence seq;
-    ExpectMessageSendInSequence(DatarouterMessageIdentifier::kAcquireRequest, seq, client);
+    ExpectAcquireNotifyInSequence(DatarouterMessageIdentifier::kAcquireRequest, seq, connection_ptr);
 
     session_map.at(kClienT0Pid).handle->AcquireRequest();
+    session_map.at(kClienT0Pid).handle->AcquireRequest();
     EXPECT_EQ(acquire_response_count, 0);
-
-    StrictMock<::score::message_passing::ServerConnectionMock> connection;
-    score::message_passing::ClientIdentity client_identity{kClienT0Pid, 0, 0};
-    EXPECT_CALL(connection, GetClientIdentity()).Times(AnyNumber()).WillRepeatedly(ReturnRef(client_identity));
 
     score::mw::log::detail::ReadAcquireResult acquire_result{0U};
     std::array<std::uint8_t, sizeof(acquire_result) + 1> message{};
     message[0] = score::cpp::to_underlying(DatarouterMessageIdentifier::kAcquireResponse);
     std::memcpy(&message[1], &acquire_result, sizeof(acquire_result));
 
-    sent_callback(connection, message);
+    sent_callback(*connection_ptr, message);
 
     EXPECT_EQ(acquire_response_count, 1);
+
+    {
+        std::array<std::uint8_t, sizeof(score::mw::log::detail::ReadAcquireResult) + 2U> bad_message{};
+        bad_message[0] = score::cpp::to_underlying(DatarouterMessageIdentifier::kAcquireResponse);
+        sent_callback(*connection_ptr, bad_message);
+        EXPECT_EQ(acquire_response_count, 2);
+    }
 
     EXPECT_EQ(closed_by_peer_count, 0);
     EXPECT_FALSE(session_map.empty());
 
-    ExpectAndFailShortMessageSend(client);
+    ExpectAndFailAcquireNotify(connection_ptr);
     ExpectServerDestruction();
-    ExpectClientDestruction(client);
     session_map.at(kClienT0Pid).handle->AcquireRequest();
     {
         // let the worker thread process the fault; wait until it erases the client
@@ -484,15 +498,15 @@ TEST_F(MessagePassingServerFixture, TestTripleConnectDifferentPids)
 
     EXPECT_EQ(construct_count, 0);
 
-    auto* client0 = ExpectConnectCallBackCalledAndClientCreated(kClienT0Pid);
-    auto* client1 = ExpectConnectCallBackCalledAndClientCreated(kClienT1Pid);
-    auto* client2 = ExpectConnectCallBackCalledAndClientCreated(kClienT2Pid);
+    auto* connection0 = ConnectClientAndSendConnectMessage(kClienT0Pid);
+    auto* connection1 = ConnectClientAndSendConnectMessage(kClienT1Pid);
+    auto* connection2 = ConnectClientAndSendConnectMessage(kClienT2Pid);
     EXPECT_EQ(construct_count, 3);
 
     ExpectServerDestruction();
-    ExpectClientDestruction(client0);
-    ExpectClientDestruction(client1);
-    ExpectClientDestruction(client2);
+    std::ignore = connection0;
+    std::ignore = connection1;
+    std::ignore = connection2;
 
     EXPECT_EQ(closed_by_peer_count, 0);
     EXPECT_EQ(destruct_count, 0);
@@ -515,21 +529,33 @@ TEST_F(MessagePassingServerFixture, TestTripleConnectSamePid)
     EXPECT_EQ(construct_count, 0);
 
     // Recieving new connect with old pid means that old pid owner died and disconnect_callback was called.
-    auto* client0 = ExpectConnectCallBackCalledAndClientCreated(kClienT0Pid);
+    auto* connection0 = ConnectClientAndSendConnectMessage(kClienT0Pid);
     EXPECT_CALL(connection, GetClientIdentity()).WillOnce(ReturnRef(client_identity));
-    ExpectClientDestruction(client0);
     this->disconnect_callback(connection);
-    using namespace std::chrono_literals;
-    std::this_thread::sleep_for(100ms);
-    auto* client1 = ExpectConnectCallBackCalledAndClientCreated(kClienT0Pid);
+    {
+        std::unique_lock<std::mutex> lock(map_mutex);
+        ASSERT_TRUE(map_cond.wait_for(lock, std::chrono::seconds{1}, [this]() {
+            return session_map.find(kClienT0Pid) == session_map.end();
+        })) << "Timed out waiting for session cleanup after first disconnect";
+    }
+    connections.erase(kClienT0Pid);
+    auto* connection1 = ConnectClientAndSendConnectMessage(kClienT0Pid);
     EXPECT_CALL(connection, GetClientIdentity()).WillOnce(ReturnRef(client_identity));
-    ExpectClientDestruction(client1);
     this->disconnect_callback(connection);
-    std::this_thread::sleep_for(100ms);
+    {
+        std::unique_lock<std::mutex> lock(map_mutex);
+        ASSERT_TRUE(map_cond.wait_for(lock, std::chrono::seconds{1}, [this]() {
+            return session_map.find(kClienT0Pid) == session_map.end();
+        })) << "Timed out waiting for session cleanup after second disconnect";
+    }
 
-    auto* client2 = ExpectConnectCallBackCalledAndClientCreated(kClienT0Pid);
-    ExpectClientDestruction(client2);
+    connections.erase(kClienT0Pid);
+    auto* connection2 = ConnectClientAndSendConnectMessage(kClienT0Pid);
     EXPECT_EQ(construct_count, 3);
+
+    std::ignore = connection0;
+    std::ignore = connection1;
+    std::ignore = connection2;
 
     ExpectServerDestruction();
 
@@ -543,6 +569,48 @@ TEST_F(MessagePassingServerFixture, TestTripleConnectSamePid)
     EXPECT_EQ(destruct_count, 3);
 }
 
+TEST_F(MessagePassingServerFixture, StaleConnectionAcquireResponseShouldBeIgnored)
+{
+    ExpectOurPidIsQueried();
+    InstantiateServer(GetCountingSessionFactory());
+
+    // Connect client (connection0) and create session.
+    auto* connection0_ptr = ConnectClientAndSendConnectMessage(kClienT0Pid);
+
+    // Disconnect the client and wait until its session is torn down.
+    this->disconnect_callback(*connection0_ptr);
+    {
+        std::unique_lock<std::mutex> lock(map_mutex);
+        map_cond.wait(lock, [this]() {
+            return session_map.empty();
+        });
+    }
+
+    // Keep the old connection object alive, but free the PID slot for the new connection.
+    auto old_connection = std::move(connections.at(kClienT0Pid));
+    connections.erase(kClienT0Pid);
+    auto* stale_connection_ptr = old_connection.get();
+
+    // Reconnect client with the same PID (connection1) and create a new session.
+    auto* connection1_ptr = ConnectClientAndSendConnectMessage(kClienT0Pid);
+
+    score::mw::log::detail::ReadAcquireResult acquire_result{0U};
+    std::array<std::uint8_t, sizeof(acquire_result) + 1> response{};
+    response[0] = score::cpp::to_underlying(DatarouterMessageIdentifier::kAcquireResponse);
+    std::memcpy(&response[1], &acquire_result, sizeof(acquire_result));
+
+    // Response on stale connection must be ignored.
+    sent_callback(*stale_connection_ptr, response);
+    EXPECT_EQ(acquire_response_count, 0);
+
+    // Response on the current connection must be accepted.
+    sent_callback(*connection1_ptr, response);
+    EXPECT_EQ(acquire_response_count, 1);
+
+    ExpectServerDestruction();
+    UninstantiateServer();
+}
+
 TEST_F(MessagePassingServerFixture, TestSamePidWhileRunning)
 {
 
@@ -553,32 +621,35 @@ TEST_F(MessagePassingServerFixture, TestSamePidWhileRunning)
     tick_blocker = true;
     EXPECT_EQ(tick_count, 0);
     EXPECT_EQ(construct_count, 0);
-    auto* client0 = ExpectConnectCallBackCalledAndClientCreated(kClienT0Pid);
-    auto* client1 = ExpectConnectCallBackCalledAndClientCreated(kClienT1Pid);
-    auto* client2 = ExpectConnectCallBackCalledAndClientCreated(kClienT2Pid);
+    auto* connection0 = ConnectClientAndSendConnectMessage(kClienT0Pid);
+    auto* connection1 = ConnectClientAndSendConnectMessage(kClienT1Pid);
+    auto* connection2 = ConnectClientAndSendConnectMessage(kClienT2Pid);
     EXPECT_EQ(construct_count, 3);
 
     ExpectServerDestruction();
 
-    // ExpectClientDestruction(client0);
     //  wait until CLIENT0 is blocked inside the first tick
     session_map.at(kClienT0Pid).WaitStartOfFirstTick();
-
-    // accumulate other ticks in the queue
-    using namespace std::chrono_literals;
-    std::this_thread::sleep_for(100ms);
 
     // we will need to unblock the tick before the callback returns, so start it on a separate thread
     std::thread connect_thread([&]() {
         StrictMock<::score::message_passing::ServerConnectionMock> connection;
         score::message_passing::ClientIdentity client_identity{kClienT0Pid, 0, 0};
         EXPECT_CALL(connection, GetClientIdentity()).WillOnce(ReturnRef(client_identity));
-        ExpectClientDestruction(client0);
         this->disconnect_callback(connection);
-        std::this_thread::sleep_for(100ms);
 
-        auto* new_client = ExpectConnectCallBackCalledAndClientCreated(kClienT0Pid);
-        ExpectClientDestruction(new_client);
+        // Wait for the old session to be fully destroyed before reconnecting
+        {
+            std::unique_lock<std::mutex> lock(map_mutex);
+            ASSERT_TRUE(map_cond.wait_for(lock, std::chrono::seconds{1}, [this]() {
+                return session_map.find(kClienT0Pid) == session_map.end();
+            })) << "Timed out waiting for old CLIENT0 session destruction";
+        }
+
+        connections.erase(kClienT0Pid);
+
+        auto* new_connection = ConnectClientAndSendConnectMessage(kClienT0Pid);
+        std::ignore = new_connection;
     });
     EXPECT_EQ(destruct_count, 0);  // no destruction while we are still in the tick
 
@@ -591,8 +662,9 @@ TEST_F(MessagePassingServerFixture, TestSamePidWhileRunning)
     EXPECT_EQ(destruct_count, 1);
     EXPECT_GE(tick_count, 2);
 
-    ExpectClientDestruction(client1);
-    ExpectClientDestruction(client2);
+    std::ignore = connection0;
+    std::ignore = connection1;
+    std::ignore = connection2;
     UninstantiateServer();
 
     EXPECT_EQ(closed_by_peer_count, 1);
@@ -608,9 +680,9 @@ TEST_F(MessagePassingServerFixture, TestSamePidWhileQueued)
     tick_blocker = true;
     EXPECT_EQ(tick_count, 0);
     EXPECT_EQ(construct_count, 0);
-    auto* client0 = ExpectConnectCallBackCalledAndClientCreated(kClienT0Pid);
-    auto* client1 = ExpectConnectCallBackCalledAndClientCreated(kClienT1Pid);
-    auto* client2 = ExpectConnectCallBackCalledAndClientCreated(kClienT2Pid);
+    auto* connection0 = ConnectClientAndSendConnectMessage(kClienT0Pid);
+    auto* connection1 = ConnectClientAndSendConnectMessage(kClienT1Pid);
+    auto* connection2 = ConnectClientAndSendConnectMessage(kClienT2Pid);
     EXPECT_EQ(construct_count, 3);
 
     ExpectServerDestruction();
@@ -618,21 +690,25 @@ TEST_F(MessagePassingServerFixture, TestSamePidWhileQueued)
     // wait until CLIENT0 is blocked inside the first tick
     session_map.at(kClienT0Pid).WaitStartOfFirstTick();
 
-    // accumulate other ticks (CLIENT2 in particular) in the queue
-    using namespace std::chrono_literals;
-    std::this_thread::sleep_for(250ms);
-
     // we will need to unblock the tick before the callback returns, so start it on a separate thread
     std::thread connect_thread([&]() {
         StrictMock<::score::message_passing::ServerConnectionMock> connection;
         score::message_passing::ClientIdentity client_identity{kClienT2Pid, 0, 0};
         EXPECT_CALL(connection, GetClientIdentity()).WillOnce(ReturnRef(client_identity));
-        ExpectClientDestruction(client2);
         this->disconnect_callback(connection);
-        std::this_thread::sleep_for(100ms);
 
-        auto* new_client = ExpectConnectCallBackCalledAndClientCreated(kClienT2Pid);
-        ExpectClientDestruction(new_client);
+        // Wait for the old session to be fully destroyed before reconnecting
+        {
+            std::unique_lock<std::mutex> lock(map_mutex);
+            ASSERT_TRUE(map_cond.wait_for(lock, std::chrono::seconds{1}, [this]() {
+                return session_map.find(kClienT2Pid) == session_map.end();
+            })) << "Timed out waiting for old CLIENT2 session destruction";
+        }
+
+        connections.erase(kClienT2Pid);
+
+        auto* new_connection = ConnectClientAndSendConnectMessage(kClienT2Pid);
+        std::ignore = new_connection;
     });
     EXPECT_EQ(destruct_count, 0);  // no destruction while we are still in the tick
 
@@ -645,14 +721,177 @@ TEST_F(MessagePassingServerFixture, TestSamePidWhileQueued)
     EXPECT_EQ(destruct_count, 1);
     EXPECT_GE(tick_count, 2);
 
-    ExpectClientDestruction(client0);
-    ExpectClientDestruction(client1);
+    std::ignore = connection0;
+    std::ignore = connection1;
+    std::ignore = connection2;
     UninstantiateServer();
 
     EXPECT_EQ(closed_by_peer_count, 1);
     EXPECT_EQ(destruct_count, 4);
 }
 
+TEST_F(MessagePassingServerFixture, WatchdogShouldTearDownUnresponsiveClient)
+{
+    ExpectOurPidIsQueried();
+
+    MessagePassingServer::AcquireWatchdogConfig watchdog_config;
+    watchdog_config.deadline = std::chrono::milliseconds{0};
+    watchdog_config.max_misses = 1U;
+    InstantiateServerWithWatchdog(GetCountingSessionFactory(), watchdog_config);
+
+    auto* connection_ptr = ConnectClientAndSendConnectMessage(kClienT0Pid);
+    ::testing::Sequence seq;
+    ExpectAcquireNotifyInSequence(DatarouterMessageIdentifier::kAcquireRequest, seq, connection_ptr);
+    session_map.at(kClienT0Pid).handle->AcquireRequest();
+
+    {
+        std::unique_lock<std::mutex> lock(map_mutex);
+        ASSERT_TRUE(map_cond.wait_for(lock, std::chrono::seconds{1}, [this]() {
+            return session_map.empty();
+        })) << "Timed out waiting for watchdog teardown";
+    }
+
+    ExpectServerDestruction();
+    UninstantiateServer();
+}
+
+TEST_F(MessagePassingServerFixture, WatchdogMissCountShouldResetOnValidResponse)
+{
+    ExpectOurPidIsQueried();
+
+    MessagePassingServer::AcquireWatchdogConfig watchdog_config;
+    watchdog_config.deadline = std::chrono::milliseconds{0};
+    watchdog_config.max_misses = 2U;
+    InstantiateServerWithWatchdog(GetCountingSessionFactory(), watchdog_config);
+
+    auto* connection_ptr = ConnectClientAndSendConnectMessage(kClienT0Pid);
+
+    ::testing::Sequence seq;
+    ExpectAcquireNotifyInSequence(DatarouterMessageIdentifier::kAcquireRequest, seq, connection_ptr);
+    ExpectAcquireNotifyInSequence(DatarouterMessageIdentifier::kAcquireRequest, seq, connection_ptr);
+    ExpectAcquireNotifyInSequence(DatarouterMessageIdentifier::kAcquireRequest, seq, connection_ptr);
+
+    // 1) First acquire request is missed by the client -> miss_count becomes 1.
+    session_map.at(kClienT0Pid).handle->AcquireRequest();
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(100ms);
+
+    // 2) Late valid response arrives -> miss_count should reset to 0.
+    score::mw::log::detail::ReadAcquireResult acquire_result{0U};
+    std::array<std::uint8_t, sizeof(acquire_result) + 1> response{};
+    response[0] = score::cpp::to_underlying(DatarouterMessageIdentifier::kAcquireResponse);
+    std::memcpy(&response[1], &acquire_result, sizeof(acquire_result));
+    sent_callback(*connection_ptr, response);
+
+    // 3) One more missed acquire should NOT tear down (max_misses = 2, miss_count should be 1).
+    session_map.at(kClienT0Pid).handle->AcquireRequest();
+    std::this_thread::sleep_for(100ms);
+    EXPECT_FALSE(session_map.empty());
+
+    // 4) Second miss after the reset should now tear down.
+    session_map.at(kClienT0Pid).handle->AcquireRequest();
+    {
+        std::unique_lock<std::mutex> lock(map_mutex);
+        ASSERT_TRUE(map_cond.wait_for(lock, std::chrono::seconds{1}, [this]() {
+            return session_map.empty();
+        })) << "Timed out waiting for watchdog teardown after miss-count reset";
+    }
+
+    ExpectServerDestruction();
+    UninstantiateServer();
+}
+
+TEST_F(MessagePassingServerFixture, EnobufsFromNotifyShouldNotKillSession)
+{
+    ExpectOurPidIsQueried();
+
+    InstantiateServer(GetCountingSessionFactory());
+
+    auto* connection_ptr = ConnectClientAndSendConnectMessage(kClienT0Pid);
+
+    // First Notify() fails with ENOBUFS (notify pool exhausted — transient).
+    EXPECT_CALL(*connection_ptr, Notify(Matcher<score::cpp::span<const std::uint8_t>>(_)))
+        .WillOnce(Return(score::cpp::make_unexpected(score::os::Error::createFromErrno(ENOBUFS))));
+
+    session_map.at(kClienT0Pid).handle->AcquireRequest();
+
+    // Session should still be alive — ENOBUFS is treated as a transient error.
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(50ms);
+    EXPECT_FALSE(session_map.empty());
+
+    // A subsequent successful Notify() should work normally.
+    ::testing::Sequence seq;
+    ExpectAcquireNotifyInSequence(DatarouterMessageIdentifier::kAcquireRequest, seq, connection_ptr);
+    session_map.at(kClienT0Pid).handle->AcquireRequest();
+
+    // Verify session is still alive after successful notify.
+    std::this_thread::sleep_for(50ms);
+    EXPECT_FALSE(session_map.empty());
+
+    ExpectServerDestruction();
+    UninstantiateServer();
+}
+
+TEST_F(MessagePassingServerFixture, NonEnobufsNotifyFailureShouldStillKillSession)
+{
+    ExpectOurPidIsQueried();
+
+    InstantiateServer(GetCountingSessionFactory());
+
+    auto* connection_ptr = ConnectClientAndSendConnectMessage(kClienT0Pid);
+
+    // Notify() fails with EINVAL (not ENOBUFS) — should still tear down the session.
+    ExpectAndFailAcquireNotify(connection_ptr);
+    session_map.at(kClienT0Pid).handle->AcquireRequest();
+
+    {
+        std::unique_lock<std::mutex> lock(map_mutex);
+        ASSERT_TRUE(map_cond.wait_for(lock, std::chrono::seconds{1}, [this]() {
+            return session_map.empty();
+        })) << "Timed out waiting for session teardown after non-ENOBUFS failure";
+    }
+
+    ExpectServerDestruction();
+    UninstantiateServer();
+}
+
+TEST_F(MessagePassingServerFixture, DisconnectDuringNotifyShouldNotCrash)
+{
+    ExpectOurPidIsQueried();
+
+    InstantiateServer(GetCountingSessionFactory());
+
+    auto* connection_ptr = ConnectClientAndSendConnectMessage(kClienT0Pid);
+
+    // Simulate a disconnect arriving right after the Notify() kernel call.
+    // In production the disconnect callback fires on the dispatch thread and can
+    // race with NotifyAcquireRequest.  NotifyAcquireRequest holds the server mutex
+    // for the duration of Notify(), so we spawn the disconnect thread inside the
+    // mock (it blocks on the mutex) and join it after AcquireRequest returns.
+    std::thread disconnect_thread;
+    EXPECT_CALL(*connection_ptr, Notify(Matcher<score::cpp::span<const std::uint8_t>>(_)))
+        .WillOnce([this, connection_ptr, &disconnect_thread](const auto /*m*/) {
+            disconnect_thread = std::thread([this, connection_ptr]() {
+                this->disconnect_callback(*connection_ptr);
+            });
+            return score::cpp::expected_blank<score::os::Error>{};
+        });
+
+    session_map.at(kClienT0Pid).handle->AcquireRequest();
+    disconnect_thread.join();
+
+    // Wait for teardown to complete.
+    {
+        std::unique_lock<std::mutex> lock(map_mutex);
+        ASSERT_TRUE(map_cond.wait_for(lock, std::chrono::seconds{1}, [this]() {
+            return session_map.empty();
+        })) << "Timed out waiting for session teardown after disconnect-during-notify";
+    }
+
+    ExpectServerDestruction();
+    UninstantiateServer();
+}
 TEST(MessagePassingServerTests, sessionWrapperCreateTest)
 {
     InSequence s;
@@ -680,25 +919,10 @@ TEST(MessagePassingServerTests, sessionWrapperCreateTest)
 TEST(MessagePassingServerTests, sessionHandleCreateTest)
 {
     const pid_t pid = 0;
-
-    auto client = score::cpp::pmr::make_unique<score::message_passing::ClientConnectionMock>(score::cpp::pmr::get_default_resource());
-
-    auto* client_raw_ptr = client.get();
     MessagePassingServer* msg_server = nullptr;
 
-    EXPECT_CALL(*client_raw_ptr,
-                Start(Matcher<score::message_passing::IClientConnection::StateCallback>(_),
-                      Matcher<score::message_passing::IClientConnection::NotifyCallback>(_)));
-
-    EXPECT_CALL(*client_raw_ptr, GetState())
-        .WillRepeatedly(Return(score::message_passing::IClientConnection::State::kReady));
-
-    EXPECT_CALL(*client_raw_ptr, Send(An<score::cpp::span<const std::uint8_t>>())).Times(1);
-
-    MessagePassingServer::SessionHandle session_handle(pid, msg_server, std::move(client));
-
-    EXPECT_NO_FATAL_FAILURE(session_handle.AcquireRequest());
-    EXPECT_CALL(*client_raw_ptr, Destruct()).Times(AnyNumber());
+    MessagePassingServer::SessionHandle session_handle(pid, msg_server);
+    EXPECT_FALSE(session_handle.AcquireRequest());
 }
 
 struct TestParams
@@ -865,25 +1089,12 @@ TEST_F(MessagePassingServerFixture, MessageCallbackUnknownMessageType)
 TEST(MessagePassingServerTests, SessionHandleAcquireRequestNotReady)
 {
     const pid_t pid = 0;
-
-    auto client = score::cpp::pmr::make_unique<score::message_passing::ClientConnectionMock>(score::cpp::pmr::get_default_resource());
-    auto* client_raw_ptr = client.get();
     MessagePassingServer* msg_server = nullptr;
 
-    EXPECT_CALL(*client_raw_ptr,
-                Start(Matcher<score::message_passing::IClientConnection::StateCallback>(_),
-                      Matcher<score::message_passing::IClientConnection::NotifyCallback>(_)));
-
-    // Return a non-Ready state to trigger "return false"
-    EXPECT_CALL(*client_raw_ptr, GetState())
-        .WillRepeatedly(Return(score::message_passing::IClientConnection::State::kStarting));
-
-    MessagePassingServer::SessionHandle session_handle(pid, msg_server, std::move(client));
+    MessagePassingServer::SessionHandle session_handle(pid, msg_server);
 
     const bool result = session_handle.AcquireRequest();
     EXPECT_FALSE(result);
-
-    EXPECT_CALL(*client_raw_ptr, Destruct()).Times(AnyNumber());
 }
 
 // Covers OnConnectRequest "ConnectMessageFromClient too small" branch:
@@ -977,17 +1188,6 @@ TEST_F(MessagePassingServerFixture, OnConnectRequestStopRequestedCoversEarlyExit
     // Request stop on the server's stop_source_ before invoking the callback
     auto* server_for_test = &(*server);
     server_for_test->stop_source_.request_stop();
-
-    // client_factory_->Create() is called before the stop check — set up the mock
-    auto client = score::cpp::pmr::make_unique<testing::StrictMock<score::message_passing::ClientConnectionMock>>(
-        score::cpp::pmr::get_default_resource());
-    auto* client_mock = client.get();
-    EXPECT_CALL(*client_factory_mock,
-                Create(Matcher<const score::message_passing::ServiceProtocolConfig&>(_),
-                       Matcher<const score::message_passing::IClientFactory::ClientConfig&>(_)))
-        .WillOnce(Return(ByMove(std::move(client))));
-    // sender is destroyed at the early return inside OnConnectRequest
-    EXPECT_CALL(*client_mock, Destruct()).Times(1);
 
     StrictMock<::score::message_passing::ServerConnectionMock> connection;
     score::message_passing::ClientIdentity client_identity{kClienT0Pid, 0, 0};

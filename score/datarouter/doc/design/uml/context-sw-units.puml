@@ -1,0 +1,54 @@
+@startuml
+
+frame ApplicationProcess {
+  node AdaptiveApplication {
+    component ApplicationLogic
+    component "score::mw::log" {
+      component log_entry
+      component "logging_serializer" as serializer
+      component logger {
+        component SharedMemoryWriter
+      }
+
+      component MessagePassingClient
+      SharedMemoryWriter ..> MessagePassingClient : notify
+
+      interface TRACE <<macro>>
+
+      TRACE -> log_entry
+      log_entry --> serializer : TryWriteIntoSharedMemory()
+      serializer --> SharedMemoryWriter : AllocAndWrite()
+      log_entry --> logger : instance()
+
+    }
+
+    component "Configuration" {
+      component "score::mw::log::detail::Configuration" as LogConfig
+      component "score::json::JsonParser" as ConfigReader
+    }
+
+    ConfigReader ..> LogConfig
+
+    ApplicationLogic --> "score::mw::log" : verbose
+    ApplicationLogic --> TRACE : non-verbose
+  }
+
+  queue "Shared Memory Buffer" as RB
+}
+
+node "Datarouter"{
+  component MessagePassingServer
+  component "Source Session" as session {
+    component SharedMemoryReader
+  }
+
+  MessagePassingServer ...> session
+}
+
+MessagePassingClient ..> MessagePassingServer: connect
+MessagePassingClient -> session: ping
+
+SharedMemoryWriter .> RB : write
+RB <. SharedMemoryReader : read
+
+@enduml

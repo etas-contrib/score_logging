@@ -187,6 +187,10 @@ class DltLogServer : score::platform::datarouter::DltNonverboseHandlerType::IOut
                                         AssignmentAction assignment_flag) override;
     std::string SetDltOutputEnable(bool enable) override;
 
+    /// Returns the current output-enable state.
+    /// Thread-safe: reads std::atomic<bool> with acquire ordering.
+    bool IsOutputEnabled() const noexcept override final;
+
     // This is used for test purpose only in google tests, to have an access to the private members.
     // Do not use this calls in implementation except unit tests.
     class DltLogServerTest;
@@ -310,8 +314,6 @@ class DltLogServer : score::platform::datarouter::DltNonverboseHandlerType::IOut
     std::unique_ptr<IDiagnosticJobParser> parser_;
 
     std::unique_ptr<ISysedrHandler> sysedr_handler_;
-
-    bool IsOutputEnabled() const noexcept override final;
 
     void SendNonVerbose(const score::mw::log::config::NvMsgDescriptor& desc,
                         uint32_t tmsp,

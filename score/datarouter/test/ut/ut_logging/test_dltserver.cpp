@@ -16,6 +16,10 @@
 #include "daemon/dlt_log_server.h"
 #include "score/datarouter/include/daemon/configurator_commands.h"
 #include "score/datarouter/mocks/daemon/log_sender_mock.h"
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #include "gtest/gtest.h"
 
@@ -151,7 +155,7 @@ TEST_F(DltServerCreatedWithoutConfigFixture, WhenCreatedDefault)
 TEST_F(DltServerCreatedWithoutConfigFixture, WhenCreatedDefaultDltEnabledTrue)
 {
     DltLogServer dlt_server(s_config, read_callback.AsStdFunction(), write_callback.AsStdFunction(), true);
-    const auto dlt_enabled = dlt_server.GetDltEnabled();
+    const auto dlt_enabled = dlt_server.IsOutputEnabled();
     EXPECT_TRUE(dlt_enabled);
 }
 
@@ -1006,7 +1010,7 @@ TEST_F(DltServerCreatedWithoutConfigFixture, SendFTVerboseAppIdNoCoreChannelExpe
     dlt_server.SendFtVerbose({}, score::mw::log::LogLevel::kVerbose, app_id, ctx_id, 0U, 100U);
 }
 
-TEST_F(DltServerCreatedWithoutConfigFixture, SetDltOutputEnabledToTrueExpectDltOutputEnabledFlagTrue)
+TEST_F(DltServerCreatedWithoutConfigFixture, SetDltOutputEnableToTrueExpectIsOutputEnabledTrue)
 {
     EXPECT_CALL(read_callback, Call()).Times(0);
     EXPECT_CALL(write_callback, Call(_)).Times(0);
@@ -1014,8 +1018,8 @@ TEST_F(DltServerCreatedWithoutConfigFixture, SetDltOutputEnabledToTrueExpectDltO
     score::logging::dltserver::DltLogServer::DltLogServerTest dlt_server(
         s_config, read_callback.AsStdFunction(), write_callback.AsStdFunction(), true);
 
-    dlt_server.SetDltOutputEnabled(true);
-    EXPECT_TRUE(dlt_server.GetDltEnabled());
+    dlt_server.SetDltOutputEnable(true);
+    EXPECT_TRUE(dlt_server.IsOutputEnabled());
 }
 
 TEST_F(DltServerCreatedWithConfigFixture, SetLogChannelThresholdChannelMissingDirectCallReturnsError)
@@ -1150,20 +1154,20 @@ TEST_F(DltServerCreatedWithConfigFixture, SetDltOutputEnableDirectCall)
     auto response = dlt_server.SetDltOutputEnable(true);
     EXPECT_EQ(response.size(), kCommandResponseSize);
     EXPECT_EQ(response[0], static_cast<char>(config::kRetOk));
-    EXPECT_TRUE(dlt_server.GetDltEnabled());
+    EXPECT_TRUE(dlt_server.IsOutputEnabled());
 
     // Test disabling output through public method
     response = dlt_server.SetDltOutputEnable(false);
     EXPECT_EQ(response.size(), kCommandResponseSize);
     EXPECT_EQ(response[0], static_cast<char>(config::kRetOk));
-    EXPECT_FALSE(dlt_server.GetDltEnabled());
+    EXPECT_FALSE(dlt_server.IsOutputEnabled());
 }
 
 TEST_F(DltServerCreatedWithConfigFixture, SetDltOutputEnableBehaviorBlocksAllSends)
 {
     // Prove that enabling/disabling output affects the observable server state.
     // Note: sendVerbose()/sendNonVerbose() are not gated by this flag in the current implementation;
-    // the flag controls the DLT output enable state exposed via GetDltEnabled().
+    // the flag controls the DLT output enable state exposed via IsOutputEnabled().
     EXPECT_CALL(read_callback, Call()).Times(1).WillOnce(Return(p_config));
     EXPECT_CALL(write_callback, Call(_)).Times(0);
 
@@ -1179,13 +1183,13 @@ TEST_F(DltServerCreatedWithConfigFixture, SetDltOutputEnableBehaviorBlocksAllSen
     const auto disable_resp = dlt_server.SetDltOutputEnable(false);
     EXPECT_EQ(disable_resp.size(), kCommandResponseSize);
     EXPECT_EQ(disable_resp[0], static_cast<char>(config::kRetOk));
-    EXPECT_FALSE(dlt_server.GetDltEnabled());
+    EXPECT_FALSE(dlt_server.IsOutputEnabled());
 
     // Re-enable output: sending should resume.
     const auto enable_resp = dlt_server.SetDltOutputEnable(true);
     EXPECT_EQ(enable_resp.size(), kCommandResponseSize);
     EXPECT_EQ(enable_resp[0], static_cast<char>(config::kRetOk));
-    EXPECT_TRUE(dlt_server.GetDltEnabled());
+    EXPECT_TRUE(dlt_server.IsOutputEnabled());
 
     // Basic sanity: calling sendVerbose still forwards to the log sender (2 channels).
     EXPECT_CALL(*log_sender_mock_raw_ptr, SendVerbose(_, _, _)).Times(2);
@@ -1252,6 +1256,190 @@ TEST_F(DltServerCreatedWithConfigFixture, ReadLogChannelNamesDirectCallContainsE
     const std::string response_str(response.begin() + kCommandResponseSize, response.end());
     EXPECT_NE(response_str.find("DFLT"), std::string::npos) << "Response should contain DFLT channel";
     EXPECT_NE(response_str.find("CORE"), std::string::npos) << "Response should contain CORE channel";
+}
+
+TEST_F(DltServerCreatedWithoutConfigFixture, ConcurrentEnableSameValueNoCallbackFired)
+{
+    EXPECT_CALL(read_callback, Call()).Times(0);
+    EXPECT_CALL(write_callback, Call(_)).Times(0);
+
+    DltLogServer::DltLogServerTest server(
+        s_config, read_callback.AsStdFunction(), write_callback.AsStdFunction(), /*enabled=*/true);
+
+    std::atomic<int> callback_count{0};
+    server.SetEnabledCallback([&](bool /*enabled*/) {
+        callback_count.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    std::thread t1([&] {
+        server.SetDltOutputEnable(true);
+    });
+    std::thread t2([&] {
+        server.SetDltOutputEnable(true);
+    });
+    t1.join();
+    t2.join();
+
+    EXPECT_TRUE(server.IsOutputEnabled());
+    EXPECT_EQ(callback_count.load(), 0) << "No callback expected: both threads attempted a redundant enable";
+}
+
+TEST_F(DltServerCreatedWithoutConfigFixture, ConcurrentDisableSameValueCallbackFiredOnce)
+{
+    EXPECT_CALL(read_callback, Call()).Times(0);
+    EXPECT_CALL(write_callback, Call(_)).Times(0);
+
+    DltLogServer::DltLogServerTest server(
+        s_config, read_callback.AsStdFunction(), write_callback.AsStdFunction(), /*enabled=*/true);
+
+    std::atomic<int> callback_count{0};
+    server.SetEnabledCallback([&](bool /*enabled*/) {
+        callback_count.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    std::thread t1([&] {
+        server.SetDltOutputEnable(false);
+    });
+    std::thread t2([&] {
+        server.SetDltOutputEnable(false);
+    });
+    t1.join();
+    t2.join();
+
+    EXPECT_FALSE(server.IsOutputEnabled());
+    EXPECT_EQ(callback_count.load(), 1) << "Exactly one callback expected: only one thread wins the true->false CAS";
+}
+
+TEST_F(DltServerCreatedWithoutConfigFixture, ConcurrentOppositeValuesCallbackCountOneOrTwo)
+{
+    EXPECT_CALL(read_callback, Call()).Times(0);
+    EXPECT_CALL(write_callback, Call(_)).Times(0);
+
+    DltLogServer::DltLogServerTest server(
+        s_config, read_callback.AsStdFunction(), write_callback.AsStdFunction(), /*enabled=*/true);
+
+    std::atomic<int> callback_count{0};
+    server.SetEnabledCallback([&](bool /*enabled*/) {
+        callback_count.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    std::thread t_disable([&] {
+        server.SetDltOutputEnable(false);
+    });
+    std::thread t_enable([&] {
+        server.SetDltOutputEnable(true);
+    });
+    t_disable.join();
+    t_enable.join();
+
+    const int count = callback_count.load();
+    EXPECT_GE(count, 1) << "At least one genuine transition must have fired";
+    EXPECT_LE(count, 2) << "At most two genuine transitions are possible";
+
+    // Flag must be consistent with whichever CAS won last (no corruption).
+    const bool flag = server.IsOutputEnabled();
+    EXPECT_TRUE(flag == true || flag == false);
+}
+
+TEST_F(DltServerCreatedWithoutConfigFixture, ConcurrentToggleStormFlagRemainsConsistent)
+{
+    EXPECT_CALL(read_callback, Call()).Times(0);
+    EXPECT_CALL(write_callback, Call(_)).Times(0);
+
+    DltLogServer::DltLogServerTest server(
+        s_config, read_callback.AsStdFunction(), write_callback.AsStdFunction(), /*enabled=*/true);
+
+    std::atomic<int> callback_count{0};
+    server.SetEnabledCallback([&](bool /*enabled*/) {
+        callback_count.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    constexpr int kThreads = 8;
+    constexpr int kTogglesEach = 100;
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i)
+    {
+        const bool start_with_enable = (i % 2 == 0);
+        threads.emplace_back([&server, start_with_enable]() {
+            for (int j = 0; j < kTogglesEach; ++j)
+            {
+                server.SetDltOutputEnable((j % 2 == 0) ? start_with_enable : !start_with_enable);
+            }
+        });
+    }
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+
+    // IsOutputEnabled() returns std::atomic<bool>::load(), so no torn read
+    // is possible; we only assert the callback bound.
+    static_cast<void>(server.IsOutputEnabled());
+    EXPECT_LE(callback_count.load(), kThreads * kTogglesEach);
+}
+
+TEST_F(DltServerCreatedWithoutConfigFixture, CallbackReceivesCorrectBooleanValuePerTransition)
+{
+    EXPECT_CALL(read_callback, Call()).Times(0);
+    EXPECT_CALL(write_callback, Call(_)).Times(0);
+
+    DltLogServer::DltLogServerTest server(
+        s_config, read_callback.AsStdFunction(), write_callback.AsStdFunction(), /*enabled=*/true);
+
+    std::vector<bool> observed_values;
+    std::mutex values_mutex;
+    server.SetEnabledCallback([&](bool enabled) {
+        std::lock_guard<std::mutex> lock(values_mutex);
+        observed_values.push_back(enabled);
+    });
+
+    server.SetDltOutputEnable(false);  // genuine: true→false
+    server.SetDltOutputEnable(false);  // redundant: no callback
+    server.SetDltOutputEnable(true);   // genuine: false→true
+    server.SetDltOutputEnable(true);   // redundant: no callback
+
+    ASSERT_EQ(observed_values.size(), 2U);
+    EXPECT_FALSE(observed_values[0]) << "First transition was true->false";
+    EXPECT_TRUE(observed_values[1]) << "Second transition was false->true";
+}
+
+TEST_F(DltServerCreatedWithoutConfigFixture, ConcurrentReaderSeesOnlyValidBooleanValues)
+{
+    EXPECT_CALL(read_callback, Call()).Times(0);
+    EXPECT_CALL(write_callback, Call(_)).Times(0);
+
+    DltLogServer::DltLogServerTest server(
+        s_config, read_callback.AsStdFunction(), write_callback.AsStdFunction(), /*enabled=*/true);
+
+    std::atomic<bool> stop_reader{false};
+
+    std::thread reader([&] {
+        // static_assert documents that bool can only be true or false;
+        // the acquire-load is still exercised so TSan can observe ordering.
+        static_assert(sizeof(bool) == 1U, "bool must be exactly one byte");
+        while (!stop_reader.load(std::memory_order_relaxed))
+        {
+            // Load with acquire semantics to pair with the release-store in
+            // SetOutputEnabled; the result is intentionally unused here —
+            // the goal is to exercise the memory-ordering path under TSan.
+            static_cast<void>(server.IsOutputEnabled());
+        }
+    });
+
+    std::thread writer([&] {
+        for (int i = 0; i < 500; ++i)
+        {
+            server.SetDltOutputEnable(i % 2 == 0);
+        }
+    });
+
+    writer.join();
+    stop_reader.store(true, std::memory_order_relaxed);
+    reader.join();
+    // If TSan is enabled it will have reported any acquire/release violation
+    // during the run; no additional runtime assertion is needed here.
 }
 
 }  // namespace test

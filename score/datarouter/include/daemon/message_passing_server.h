@@ -18,7 +18,6 @@
 
 #include "score/mw/log/detail/data_router/shared_memory/common.h"
 
-#include "score/message_passing/i_client_factory.h"
 #include "score/message_passing/i_server_connection.h"
 #include "score/message_passing/i_server_factory.h"
 #include "score/mw/log/detail/logging_identifier.h"
@@ -28,6 +27,7 @@
 
 #include "score/concurrency/interruptible_wait.h"
 #include <score/stop_token.hpp>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -35,6 +35,7 @@
 #include <queue>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace score
 {
@@ -68,25 +69,37 @@ class IMessagePassingServerSessionWrapper
 class MessagePassingServer : public IMessagePassingServerSessionWrapper
 {
   public:
+    struct AcquireWatchdogConfig
+    {
+        AcquireWatchdogConfig(std::chrono::milliseconds deadline_in = std::chrono::milliseconds{1000},
+                              std::uint32_t max_misses_in = 3U)
+            : deadline(deadline_in), max_misses(max_misses_in)
+        {
+        }
+
+        std::chrono::milliseconds deadline;
+        std::uint32_t max_misses;
+    };
     class SessionHandle : public daemon::ISessionHandle
     {
       public:
-        SessionHandle(pid_t pid,
-                      MessagePassingServer* server,
-                      score::cpp::pmr::unique_ptr<score::message_passing::IClientConnection> sender)
-            : daemon::ISessionHandle(), sender_(std::move(sender)), pid_(pid), server_(server), sender_state_{}
-        {
-        }
+        SessionHandle(pid_t pid, MessagePassingServer* server) : daemon::ISessionHandle(), pid_(pid), server_(server) {}
 
         bool AcquireRequest() const override;
 
       private:
-        score::cpp::pmr::unique_ptr<score::message_passing::IClientConnection> sender_;
         pid_t pid_;
         MessagePassingServer* server_;
-        mutable std::optional<score::message_passing::IClientConnection::State> sender_state_;
     };
 
+    /// Thread-safety contract:
+    /// - Tick() is called from the worker thread without the server mutex held.
+    /// - OnAcquireResponse() is called from the dispatch thread with the server mutex held.
+    /// - OnClosedByPeer() is called from the worker thread without the server mutex held.
+    /// - IsSourceClosed() is called from the worker thread with the server mutex held.
+    /// Implementations must ensure that shared state accessed by Tick() and by any method
+    /// called under the mutex (OnAcquireResponse, IsSourceClosed) is properly synchronized
+    /// (e.g., via atomics or an internal lock).
     class ISession
     {
       public:
@@ -102,31 +115,39 @@ class MessagePassingServer : public IMessagePassingServerSessionWrapper
                                                 const score::mw::log::detail::ConnectMessageFromClient&,
                                                 score::cpp::pmr::unique_ptr<daemon::ISessionHandle>)>;
 
-    explicit MessagePassingServer(SessionFactory factory,
-                                  std::shared_ptr<score::message_passing::IServerFactory> server_factory = nullptr,
-                                  std::shared_ptr<score::message_passing::IClientFactory> client_factory = nullptr);
+    MessagePassingServer(SessionFactory factory,
+                         std::shared_ptr<score::message_passing::IServerFactory> server_factory = nullptr,
+                         AcquireWatchdogConfig watchdog_config = AcquireWatchdogConfig{});
     ~MessagePassingServer() noexcept;
 
     // for unit test only. to keep rest of functions in private
     class MessagePassingServerForTest;
 
   private:
-    void NotifyAcquireRequestFailed(std::int32_t pid);
+    friend class SessionHandle;
 
-    void MessageCallback(const score::cpp::span<const std::uint8_t> message, const pid_t pid);
-    void OnConnectRequest(const score::cpp::span<const std::uint8_t> message, const pid_t pid);
-    void OnAcquireResponse(const score::cpp::span<const std::uint8_t> message, const pid_t pid);
+    bool NotifyAcquireRequest(pid_t pid);
+
+    void MessageCallback(score::message_passing::IServerConnection& connection, score::cpp::span<const std::uint8_t> message);
+    void OnConnectRequest(score::message_passing::IServerConnection& connection,
+                          const score::cpp::span<const std::uint8_t> message,
+                          pid_t pid);
+    void OnAcquireResponse(score::message_passing::IServerConnection& connection,
+                           const score::cpp::span<const std::uint8_t> message,
+                           pid_t pid);
 
     using TimestampT = std::chrono::steady_clock::time_point;
 
     struct SessionWrapper
     {
-        SessionWrapper(IMessagePassingServerSessionWrapper* server_instance,
-                       pid_t process_id,
-                       std::unique_ptr<ISession> session_instance)
-            : server(server_instance),
-              pid(process_id),
-              session(std::move(session_instance)),
+        SessionWrapper(IMessagePassingServerSessionWrapper* message_passing_server,
+                       pid_t client_pid,
+                       std::unique_ptr<ISession> message_passing_session)
+            : server(message_passing_server),
+              pid(client_pid),
+              session(std::move(message_passing_session)),
+              connection(nullptr),
+              acquire_in_flight(false),
               enqueued(false),
               running(false),
               to_delete(false),
@@ -165,6 +186,11 @@ class MessagePassingServer : public IMessagePassingServerSessionWrapper
         pid_t pid;
         std::unique_ptr<ISession> session;
 
+        score::message_passing::IServerConnection* connection;
+        bool acquire_in_flight;
+        std::optional<TimestampT> acquire_deadline;
+        std::uint32_t acquire_miss_count{0U};
+
         bool enqueued;
         bool running;
         bool to_delete;
@@ -187,13 +213,18 @@ class MessagePassingServer : public IMessagePassingServerSessionWrapper
     score::cpp::jthread worker_thread_;
     std::condition_variable worker_cond_;  // to wake up worker thread
     std::unordered_map<pid_t, SessionWrapper> pid_session_map_;
+    // Tracks client PIDs that disconnected before a session could be created/emplaced.
+    // This closes a race where OnConnectRequest creates a session outside mutex_ while
+    // disconnect_callback may already have run and the connection object may be gone.
+    std::unordered_set<pid_t> disconnected_pids_;
     std::queue<pid_t> work_queue_;
     std::atomic<bool> workers_exit_;
     std::condition_variable server_cond_;  // to wake up server thread
     bool session_finishing_;
 
     std::shared_ptr<score::message_passing::IServerFactory> server_factory_;
-    std::shared_ptr<score::message_passing::IClientFactory> client_factory_;
+
+    AcquireWatchdogConfig watchdog_config_;
 };
 
 }  // namespace internal

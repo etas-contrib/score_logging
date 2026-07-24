@@ -1,0 +1,39 @@
+@startuml
+
+title Tracing operation: write
+
+participant UserFunction
+participant "TRACE(arg)" as TRACE_FN
+participant "LogEntry<TYPE>::Instance()" as log_entry
+participant "Logger::Instance()" as loggerinst
+participant "SharedMemoryWriter" as shm_writer
+participant "logging_serializer" as serializer
+
+UserFunction -> TRACE_FN ++: TRACE(variable)
+
+group First time only: type registration
+TRACE_FN -> log_entry ++ : Instance()
+log_entry -> log_entry : RegisterTypeGetId()
+log_entry -> loggerinst ++ : RegisterType<T>()
+loggerinst -> shm_writer ++ : TryRegisterType()
+loggerinst <-- shm_writer -- : TypeIdentifier
+log_entry <-- loggerinst -- : TypeIdentifier
+log_entry --> TRACE_FN -- : LogEntry&
+end
+
+|||
+
+group Normal serialization
+TRACE_FN -> log_entry ++ : TryWriteIntoSharedMemory(variable)
+log_entry -> loggerinst ++ : GetSharedMemoryWriter()
+log_entry <-- loggerinst -- : SharedMemoryWriter&
+log_entry -> shm_writer ++ : AllocAndWrite(serialize_fn, type_id, size)
+shm_writer -> serializer ++ : serialize(variable, buffer, size)
+shm_writer <-- serializer -- : bytes_written
+log_entry <-- shm_writer --
+TRACE_FN <-- log_entry --
+end
+
+UserFunction <-- TRACE_FN --
+
+@enduml
